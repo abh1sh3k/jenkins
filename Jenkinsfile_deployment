@@ -1,0 +1,148 @@
+pipeline {
+    agent { label 'First_Slave' }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '1'))
+    }
+	
+	parameters {
+		string defaultValue: '/opt', description: '', name: 'INSTALLER_PATH', trim: true
+		string defaultValue: '/home/user', description: '', name: 'INSTALL_PATH', trim: true
+		string defaultValue: 'user', description: '', name: 'SYSTEM_USER', trim: true
+	}
+    
+    environment {
+        NEXUS_URL="http://<some ip>:8081/nexus/repository"
+        XYZ_VERSION="${params.XYZ_VERSION}"
+        INSTALL_PATH="${params.INSTALL_PATH}"
+		INSTALLER_PATH="${params.INSTALLER_PATH}"
+		TEST_DIR="/tmp/testscripts"
+		USER="${params.SYSTEM_USER}"
+    }
+    
+    stages {
+		stage('Workspace Cleanup') {
+			steps {
+				cleanWs()
+				script {
+					downloadBinaries()
+				}
+			}
+		}
+		stage('Run Uninstaller') {
+			steps {
+				script {
+					runUninstaller()
+				}
+			}
+		}
+		stage('Install XYZ') {
+			steps {
+				script {
+					configureInstaller()
+					installXYZ()
+				}
+			}
+		}
+		stage('Start Services') {
+			steps {
+				script {
+					startService()
+				}
+			}
+		}
+	}				   
+}
+
+def downloadBinaries() {
+	sh '''
+		ssh -tt root@${DEPLOY_MASTER_NODE} <<-ENDSSH
+			rm -rf ${TEST_DIR} && mkdir -p ${TEST_DIR} && cd ${TEST_DIR}
+			wget -q ${NEXUS_URL}/Appsone_Release/${XYZ_VERSION}.tar.gz
+			wget -q ${NEXUS_URL}/test-artifacts/checkXYZ.sh
+			wget -q ${NEXUS_URL}/test-artifacts/AutomateInstaller.exp
+			wget -q ${NEXUS_URL}/test-artifacts/startServices.exp
+			wget -q ${NEXUS_URL}/test-artifacts/unInstaller.sh
+			wget -q ${NEXUS_URL}/test-artifacts/Wrapper_Root_jenkins.sh
+			wget -q ${NEXUS_URL}/test-artifacts/generalConf_${DEPLOY_MASTER_NODE}.py
+			chmod +x *.sh *.exp
+			exit
+ENDSSH
+	'''
+}
+
+def runUninstaller() {
+	sh '''
+        ssh -tt root@${DEPLOY_MASTER_NODE} <<-ENDSSH
+            cd ${TEST_DIR}
+            bash checkXYZ.sh ${INSTALL_PATH} ${INSTALLER_PATH} ${DEPLOY_MASTER_NODE}
+            exit
+ENDSSH
+	'''
+}
+
+def configureInstaller() {
+	sh '''
+		ssh -tt root@${DEPLOY_MASTER_NODE} <<-ENDSSH 
+		    cd ${TEST_DIR}
+		    rm -rf ${INSTALLER_PATH}/XYZ*
+			mv ${TEST_DIR}/${XYZ_VERSION}.tar.gz ${INSTALLER_PATH}
+			cd ${INSTALLER_PATH}
+			tar -xzf ${XYZ_VERSION}.tar.gz
+			rm -rf ${XYZ_VERSION}.tar.gz
+			mv -f ${TEST_DIR}/generalConf_${DEPLOY_MASTER_NODE}.py ${INSTALLER_PATH}/${XYZ_VERSION}/conf/generalConf.py
+			mv ${TEST_DIR}/*.exp ${INSTALLER_PATH}/${XYZ_VERSION}/
+			sed -i "/LOCAL_NODE.*/c LOCAL_NODE='${DEPLOY_MASTER_NODE}'" ${INSTALLER_PATH}/${XYZ_VERSION}/conf/extendedConf.py
+			chown -R ${USER}:${USER} ${INSTALLER_PATH}/${XYZ_VERSION}
+			exit
+ENDSSH
+	'''
+}
+
+def installXYZ() {
+	sh '''
+		ssh -tt root@${DEPLOY_MASTER_NODE} <<-ENDSSH 
+			cd ${INSTALLER_PATH}/${XYZ_VERSION}
+			expect AutomateInstaller.exp
+			exit
+ENDSSH
+	'''
+}
+
+def startService() {
+    sh '''
+		ssh -tt root@${DEPLOY_MASTER_NODE} <<-ENDSSH
+		    cd ${INSTALL_PATH}/Appsone_Service/data
+		    tar -xvzf percona.tar.gz percona
+			cp ${INSTALLER_PATH}/${XYZ_VERSION}/startServices.exp ${INSTALL_PATH}/
+			cd ${INSTALL_PATH}
+			expect startServices.exp
+			exit
+ENDSSH
+    '''
+}
+
+def configureSDM() {
+	sh '''
+		ssh -tt root@${DEPLOY_MASTER_NODE} <<-ENDSSH 
+		KEYCLOAK_IP=`hostname -I | awk '{print $1}'`
+		KEYCLOAK_PORT="8443"
+		KEYCLOAK_USER="XYZadmin"
+		KEYCLOAK_PASSWORD="XYZ@123"
+		
+		while [ "${ACCESS_TOKEN}" != "0" ]
+		do
+			ACCESS_TOKEN=`curl -s -k -X POST -d "client_id=admin-cli" -d "username=${KEYCLOAK_USER}" -d "password=${KEYCLOAK_PASSWORD}" -d "grant_type=password" https://${KEYCLOAK_IP}:${KEYCLOAK_PORT}/auth/realms/master/protocol/openid-connect/token | jq '.access_token'`
+			if [ "${ACCESS_TOKEN}" != "null" ]; then
+				ACCESS_TOKEN="0"
+			fi
+			sleep 30
+		done
+		tar -xzf sdmUploader.tar.gz
+		cd sdmUploader
+		sed -i "s/192.168.13.180/${KEYCLOAK_IP}/g" sdmUploader.sh
+		chmod +x sdmUploader.sh
+		sh sdmUploader.sh
+ENDSSH
+	'''
+}

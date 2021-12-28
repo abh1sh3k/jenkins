@@ -1,0 +1,136 @@
+pipeline {
+    agent { label 'First_Slave' }
+    parameters {
+        extendedChoice description: '', multiSelectDelimiter: ',', name: 'PROJECTS', quoteValue: false, saveJSONParameterToFile: false, type: 'PT_CHECKBOX', value: 'project1,project2,project3', visibleItemCount: 10
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+    }
+    
+    stages{
+        stage('Cleanup & Initial Setup') {
+            steps {
+                cleanWs()
+				sh "touch versions"
+            }
+        }
+        stage('Checkout & Release'){
+            steps{
+                script {
+                    PROJECTS.split(',').each {
+						if(it == "project2") {
+							checkout(it,"develop-xyz")
+						}
+						else {
+							checkout(it,"develop")
+						}
+						releaseProjects(it)
+                    }
+                }
+            }
+        }
+    }
+}
+
+def mergeRequest(project_name, branch_name) {
+	dir(project_name) {
+		sh '''
+			curl -X POST -H "Content-Type: application/json" -u xyz:xyz_1 https://bitbucket.org/api/2.0/repositories/xyz/''' + project_name + '''/pullrequests -d '{ "title": "Merge develop to master branch", "description": "Merge develop to master branch", "source": { "branch": { "name": "''' + branch_name + '''" }, "repository": { "full_name": "xyz/''' + project_name + '''" } }, "destination": { "branch": { "name": "master" } }, "reviewers": [ { "uuid": "{6ce8c227-b1dd-40f6-a832}" } ], "close_source_branch": false }'
+		'''
+	}
+}
+
+def checkout(project_name, branch_name) {
+	dir(project_name) {
+		checkout([$class: 'GitSCM',
+			branches: [[name: branch_name]],
+			doGenerateSubmoduleConfigurations: false,
+			extensions: [],
+			gitTool: 'Default',
+			submoduleCfg: [],
+			userRemoteConfigs: [[credentialsId: 'fd197b00-fd06-4632-a018-36134111e086',url: "https://bitbucket.org/xyz/"+ project_name +".git"]]
+		])
+	}
+	sh "echo ${project_name} checked out from bitbucket !!"
+}
+
+def mvnRelease(jobName,gitParameters,projectDir) {
+	sh '''
+		cd ${WORKSPACE}/'''+ projectDir + '''
+		git checkout develop
+		mvn versions:set -DremoveSnapshot versions:commit
+		VER=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive exec:exec)
+		git commit -am "Release version for ${VER}"
+		git push origin develop
+		git tag -a "ver-${VER}" -m "Release version ${VER}"
+		git push origin ver-${VER}
+		echo ''' + projectDir + ''' ${VER} >> ${WORKSPACE}/versions
+	'''
+	build job: jobName, parameters: gitParameters
+	mergeRequest(projectDir,"develop")
+	sh '''
+		cd ${WORKSPACE}/'''+ projectDir + '''
+		git checkout develop
+		mvn versions:set -DnextSnapshot=true versions:commit
+		git commit -am "Updated to next snapshot version"
+		git push origin develop
+	'''
+}
+
+def releaseProjects(project_name) {
+	if("${project_name}" == "project1") {
+		dir(project_name) {
+			sh '''
+				mvn versions:use-releases -DincludesList="com.abc.xyz:common" versions:commit
+			'''
+			 VARS_XYZ=sh(returnStatus: true, script: 'mvn dependency:list | grep -i snapshot | grep compile |awk -F":" -v OFS=\',\' \'{print \$2}\' | sort | uniq | egrep "common"')
+		}
+		if (VARS_XYZ == 0) {
+			echo "appsone"
+
+			// Checkout and release appsone
+			checkout("project2","develop")
+			mvnRelease("project2",[gitParameter(name: 'BRANCH_NAME', value: "develop")],"project2")
+			dir(project_name) {
+				sh "mvn versions:use-releases -Dincludes=com.abc.xyz:common versions:commit"
+			}
+		}
+		dir(project_name) {
+			mvnRelease("project1",[gitParameter(name: 'BRANCH', value: "develop")],"project2")
+		}
+	}
+    //project2 project
+	if ("${project_name}" == "project2") {
+		dir(project_name) {
+			sh '''
+			    mvn versions:use-releases -DincludesList="com.abc.xyz:utility,com.abc.xyz.keycloak:session-validator" versions:commit
+			'''
+			VARS_ENRICH=sh(returnStatus: true, script: 'mvn dependency:list | grep -i snapshot | grep compile | awk -F":" -v OFS=\',\' \'{print \$2}\' | sort | uniq | egrep "utility"')
+			VARS_KEYCLOAK=sh(returnStatus: true, script: 'mvn dependency:list | grep -i snapshot | grep compile | awk -F":" -v OFS=\',\' \'{print \$2}\' | sort | uniq | egrep "session-validator"')
+		}
+		if (VARS_ENRICH == 0) {
+			echo "utility"
+
+			// Checkout and release utility
+			checkout("utility","develop")
+			mvnRelease("utility",[gitParameter(name: 'BRANCH', value: "develop")],"utility")
+			dir(project_name) {
+				sh "mvn versions:use-releases -Dincludes=com.abc.xyz:utility versions:commit"
+			}
+		}
+		if (VARS_KEYCLOAK == 0) {
+			echo "session-validator"
+
+			// Checkout and release keycloak session validator
+			checkout("session-validator","develop")
+			keycloakRelease()
+			dir(project_name) {
+				sh "mvn versions:use-releases -Dincludes=com.abc.xyz.keycloak:session-validator versions:commit"
+			}
+		}
+		dir(project_name) {
+		    mvnRelease("project2",[gitParameter(name: 'BRANCH_NAME', value: "develop")],"project2")
+		}
+	}
+}

@@ -1,0 +1,77 @@
+pipeline {
+    agent { label 'First_Slave' }
+    environment {
+        NEXUS_COMMON_CREDS = credentials('0981d455-e100-4f93-9faf-151ac7e29d8a')
+        NEXUS_URL = 'http://<some ip>:8081'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+	    office365ConnectorWebhooks([[
+                name: 'Jenkins',
+                notifyBackToNormal: true,
+                notifyFailure: true,
+                notifySuccess: true,
+                notifyUnstable: true,
+                url: "<some url>"
+            ]]
+        )
+    }
+
+    parameters {
+        gitParameter branchFilter: 'origin/(.*)', defaultValue: 'master', name: 'BRANCH', type: 'PT_BRANCH_TAG'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    currentBuild.displayName = "#${BUILD_NUMBER}->${params.BRANCH}"
+                    currentBuild.description = "Branch: ${params.BRANCH} is used for this build"
+                }
+                git branch: "${params.BRANCH}", url: '<some git url>', credentialsId: "fd197b00-fd06-4632-a018-36134111e086"
+            }
+        }
+        stage('Build') {
+            steps {
+                withSonarQubeEnv('sonarqube_40') {
+                    sh 'mvn clean install sonar:sonar'
+                }
+            }
+        }
+        stage('Archive Builds') {
+            steps {
+		        sh "mv target/service*.tar.gz service.tar.gz"
+                archiveArtifacts artifacts: 'service.tar.gz', fingerprint: true
+            }
+        }
+        stage('Docker build') {
+            steps {
+                sh "tar -xvf service.tar.gz"
+                script {
+                    pom = readMavenPom file: 'pom.xml'
+                    version = pom.version
+                }
+                echo "Building project in version: ${version}"
+                sh "docker build -t service:${version} ."
+            }
+        }
+        stage('Publish Docker Image') {
+            steps {
+                sh "docker save service:${version} > service_${version}.tar"
+                sh "curl -v -u ${NEXUS_COMMON_CREDS} --upload-file service_${version}.tar ${NEXUS_URL}/nexus/repository/tls_docker_images/service_${version}.tar"
+                sh "echo service_${version} > /tmp/service_version"
+            }
+            post {
+                always {
+                    sh "docker rmi -f service:${version}"
+                }
+            }
+        }
+        stage('Cleanup') {
+            steps {
+                cleanWs()
+            }
+        }
+    }
+}
